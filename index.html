@@ -836,6 +836,21 @@
     *, *::before, *::after { scroll-behavior:auto !important; animation-duration:.01ms !important; transition-duration:.01ms !important; }
   }
 
+
+  /* v37 onboard bus matching */
+  .onboard-panel { margin:12px 0 14px; padding:13px; border:1px solid var(--line); border-radius:16px; background:var(--card,#fff); box-shadow:0 5px 18px rgba(15,23,42,.045); }
+  .onboard-heading { display:flex; align-items:flex-start; gap:10px; }
+  .onboard-icon { display:grid; place-items:center; width:38px; height:38px; flex:0 0 38px; border-radius:12px; background:var(--soft,#f2f6fb); font-size:20px; }
+  .onboard-heading div { display:grid; gap:4px; min-width:0; }
+  .onboard-heading strong { font-size:13px; }
+  .onboard-heading small,.onboard-note { color:var(--muted); font-size:11px; line-height:1.45; }
+  .onboard-actions { display:flex; gap:8px; margin-top:11px; }
+  .onboard-actions button { min-height:40px; padding:8px 13px; border-radius:11px; }
+  #clearOnboard { border:1px solid var(--line); background:transparent; color:var(--text); }
+  .onboard-note { display:block; margin-top:9px; }
+  body[data-theme="dark"] .onboard-panel { background:#111e31; border-color:#2a3b54; }
+  body[data-theme="dark"] .onboard-icon { background:#1d2d44; }
+
 </style>
 
 <link rel="manifest" href="./manifest.webmanifest">
@@ -869,6 +884,14 @@
         <span><i style="background:#2563eb"></i> You</span>
         <span><i style="background:#f97316"></i> Selected bus</span>
         <span><i style="background:#16a34a"></i> Other buses</span>
+      </div>
+      <div class="onboard-panel" id="onboardPanel">
+        <div class="onboard-heading"><span class="onboard-icon">🚌</span><div><strong>Onboard bus detection</strong><small id="onboardStatus" aria-live="polite">Share your GPS location while travelling to find a matching bus.</small></div></div>
+        <div class="onboard-actions">
+          <button id="confirmOnboard" class="primary" type="button" disabled>I'm on this bus</button>
+          <button id="clearOnboard" type="button" hidden>End trip</button>
+        </div>
+        <small class="onboard-note">Matches your phone's GPS movement with live bus location, speed and direction. Confirm the suggested bus yourself.</small>
       </div>
       <div class="metrics-grid">
         <div class="metric"><b id="busCount">—</b><small>Vehicles returned by Compass</small></div>
@@ -1034,6 +1057,9 @@
   const busMarkers = new Map();
   let userMarker = null, userCircle = null, userPos = null, selectedId = null, buses = [];
   let followSelected = false, autoNearest = true, routeLayer = null, routeTarget = null, routeRequestInFlight = false;
+  let deviceSamples = [];
+  let onboardCandidateId = null, onboardCandidateCount = 0, onboardBusId = null;
+  let deviceMotion = {speed:null, heading:null, accuracy:null};
   const busHistory = new Map(), historyLayers = new Map();
   const HISTORY_LIMIT = 30, MOVING_KMH = 2, STALE_AFTER_MS = 5 * 60 * 1000;
   const $ = id => document.getElementById(id);
@@ -1406,6 +1432,118 @@
     return pool.reduce((best,b) => !best || distanceKm(userPos,{lat:+b.latitude,lon:+b.longitude}) < distanceKm(userPos,{lat:+best.latitude,lon:+best.longitude}) ? b : best, null);
   }
 
+  function updateDeviceMotion(position) {
+    const now = position.timestamp || Date.now();
+    const coords = position.coords || {};
+    const lat = Number(coords.latitude), lon = Number(coords.longitude);
+    const accuracy = Number(coords.accuracy);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+    const previous = deviceSamples[deviceSamples.length - 1];
+    let measuredSpeed = Number.isFinite(coords.speed) && coords.speed >= 0 ? coords.speed * 3.6 : null;
+    let measuredHeading = Number.isFinite(coords.heading) ? coords.heading : null;
+    if (previous && now > previous.t) {
+      const elapsedHours = (now - previous.t) / 3600000;
+      const movedKm = distanceKm({lat:previous.lat,lon:previous.lon},{lat,lon});
+      if (measuredSpeed === null && elapsedHours > 0 && movedKm >= 0.008) measuredSpeed = movedKm / elapsedHours;
+      if (measuredHeading === null && movedKm >= 0.012) measuredHeading = bearingBetween({lat:previous.lat,lon:previous.lon},{lat,lon});
+    }
+    deviceSamples.push({t:now,lat,lon});
+    deviceSamples = deviceSamples.filter(sample => now - sample.t <= 120000).slice(-8);
+    deviceMotion = {speed:measuredSpeed, heading:measuredHeading, accuracy:Number.isFinite(accuracy)?accuracy:999};
+  }
+
+  function findOnboardCandidate() {
+    if (!userPos || !buses.length || deviceMotion.accuracy > 80) return null;
+    const userSpeed = deviceMotion.speed;
+    if (userSpeed === null || userSpeed < 8) return null;
+    const candidates = [];
+    for (const bus of buses) {
+      const age = ageMs(bus);
+      if (age === null || age > STALE_AFTER_MS) continue;
+      const busSpeed = Math.max(0, Number(bus.speed) || 0);
+      if (busSpeed < 5) continue;
+      const gap = distanceKm(userPos,{lat:Number(bus.latitude),lon:Number(bus.longitude)}) * 1000;
+      if (gap > 250) continue;
+      const speedGap = Math.abs(userSpeed - busSpeed);
+      if (speedGap > Math.max(8, userSpeed * 0.5)) continue;
+      const busHeading = Number(bus.heading);
+      if (Number.isFinite(deviceMotion.heading) && Number.isFinite(busHeading) &&
+          angleDiff(deviceMotion.heading, busHeading) > 50) continue;
+      const score = gap + speedGap * 8;
+      candidates.push({bus, gap, speedGap, score});
+    }
+    candidates.sort((a,b)=>a.score-b.score);
+    if (candidates.length > 1 && candidates[1].score - candidates[0].score < 35) return null;
+    return candidates[0] || null;
+  }
+
+  function updateOnboardDetection() {
+    const status = $('onboardStatus');
+    const confirm = $('confirmOnboard');
+    const clear = $('clearOnboard');
+    if (onboardBusId) {
+      const bus = buses.find(item => String(item.id) === String(onboardBusId));
+      if (!bus) {
+        onboardBusId = null;
+      } else {
+        status.textContent = `Trip active: ${bus.name || `Bus ${bus.id}`} · ${Number(bus.speed || 0).toFixed(1)} km/h`;
+        confirm.disabled = true;
+        confirm.textContent = 'Bus confirmed';
+        clear.hidden = false;
+        return;
+      }
+    }
+    clear.hidden = true;
+    const match = findOnboardCandidate();
+    if (!match) {
+      onboardCandidateId = null;
+      onboardCandidateCount = 0;
+      confirm.disabled = true;
+      confirm.textContent = "I'm on this bus";
+      status.textContent = !userPos
+        ? 'Share your GPS location while travelling to find a matching bus.'
+        : deviceMotion.accuracy > 80
+          ? 'GPS accuracy is too low. Move near a window or wait for a better GPS fix.'
+          : deviceMotion.speed === null || deviceMotion.speed < 8
+            ? 'Waiting for clear travel movement. Keep GPS enabled while the bus is moving.'
+            : 'No clear bus match yet. We will keep comparing nearby buses.';
+      return;
+    }
+    const id = String(match.bus.id);
+    onboardCandidateCount = id === onboardCandidateId ? onboardCandidateCount + 1 : 1;
+    onboardCandidateId = id;
+    const busName = match.bus.name || `Bus ${match.bus.id}`;
+    confirm.disabled = onboardCandidateCount < 3;
+    confirm.textContent = confirm.disabled ? `Checking ${busName}…` : `Confirm ${busName}`;
+    status.textContent = `Possible match: ${busName} · about ${Math.round(match.gap)} m away · speeds ${deviceMotion.speed.toFixed(0)} / ${Number(match.bus.speed).toFixed(0)} km/h. ${onboardCandidateCount}/3 checks`;
+  }
+
+  $('confirmOnboard').addEventListener('click', () => {
+    if (!onboardCandidateId || onboardCandidateCount < 3) return;
+    const bus = buses.find(item => String(item.id) === String(onboardCandidateId));
+    if (!bus) return;
+    onboardBusId = String(bus.id);
+    autoNearest = false;
+    selectedId = onboardBusId;
+    selectBus(onboardBusId, true);
+    $('onboardStatus').textContent = `Trip active: ${bus.name || `Bus ${bus.id}`} · You're following this bus.`;
+    $('confirmOnboard').disabled = true;
+    $('confirmOnboard').textContent = 'Bus confirmed';
+    $('clearOnboard').hidden = false;
+    $('nearest').classList.remove('on');
+    $('nearest').textContent = 'Find nearest bus';
+  });
+  $('clearOnboard').addEventListener('click', () => {
+    onboardBusId = null;
+    onboardCandidateId = null;
+    onboardCandidateCount = 0;
+    $('confirmOnboard').disabled = true;
+    $('confirmOnboard').textContent = "I'm on this bus";
+    $('clearOnboard').hidden = true;
+    $('onboardStatus').textContent = 'Trip ended. Share GPS to detect another bus.';
+    updateOnboardDetection();
+  });
+
   function medianValue(values) {
     if (!values.length) return null;
     const sorted = values.slice().sort((a,b)=>a-b);
@@ -1536,6 +1674,7 @@
     const marker = busMarkers.get(String(id));
     if (marker && pan) map.panTo(marker.getLatLng());
     renderBusList(); updateSelectionStats();
+    updateOnboardDetection();
     for (const [busId, busMarker] of busMarkers) busMarker.setIcon(busId === String(selectedId) ? selectedBusIcon : busIcon);
     renderSelectedHistory();
     if (routeLayer) { map.removeLayer(routeLayer); routeLayer = null; }
@@ -1736,6 +1875,7 @@
     setStatus('Waiting for Chrome location permission and a GPS fix. If prompted, choose Allow.', null);
     navigator.geolocation.watchPosition(position => {
       userPos = {lat:position.coords.latitude, lon:position.coords.longitude};
+      updateDeviceMotion(position);
       const accuracy = position.coords.accuracy || 0;
       $('myPosition').textContent = `${userPos.lat.toFixed(5)}, ${userPos.lon.toFixed(5)}`;
       if (!userMarker) userMarker = L.marker([userPos.lat,userPos.lon], {icon:userIcon}).addTo(map).bindPopup('Your current location');
@@ -1743,6 +1883,7 @@
       if (!userCircle) userCircle = L.circle([userPos.lat,userPos.lon], {radius:accuracy, color:'#2563eb', weight:1, fillOpacity:.08}).addTo(map);
       else userCircle.setLatLng([userPos.lat,userPos.lon]).setRadius(accuracy);
       $('locate').textContent = 'Location sharing on'; $('locate').disabled = false;
+      updateOnboardDetection();
       if (autoNearest && buses.length) findNearestBus();
       else { updateSelectionStats(); fitUserAndSelectedBus(); }
       if (routeTarget) {
