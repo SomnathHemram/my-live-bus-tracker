@@ -1,4 +1,4 @@
-const CACHE_NAME = 'my-live-bus-tracker-v35';
+const CACHE_NAME = 'my-live-bus-tracker-v36';
 const APP_SHELL = [
   './',
   './index.html',
@@ -54,16 +54,4 @@ self.addEventListener('fetch', event => {
       return response;
     }))
   );
-});
-
-self.addEventListener('notificationclick', event => {
-  event.notification.close();
-  const target = new URL('./', self.location.href).href;
-  event.waitUntil((async () => {
-    const windows = await clients.matchAll({type:'window', includeUncontrolled:true});
-    for (const client of windows) {
-      if ('focus' in client) { await client.focus(); return; }
-    }
-    if (clients.openWindow) await clients.openWindow(target);
-  })());
 });
