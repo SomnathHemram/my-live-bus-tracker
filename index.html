@@ -1563,8 +1563,12 @@
     return true;
   }
   function renderBusList() {
-    const host = $('busList'); host.innerHTML = '';
-    if (!buses.length) { host.innerHTML = '<div class="hint">No vehicle positions returned.</div>'; $('busResults').textContent='0 buses'; return; }
+    const host = $('busList');
+    if (!buses.length) {
+      host.replaceChildren(Object.assign(document.createElement('div'), {className:'hint', textContent:'No vehicle positions returned.'}));
+      $('busResults').textContent='0 buses';
+      return;
+    }
     const query = ($('busSearch')?.value || '').trim().toLowerCase();
     const filter = $('busFilter')?.value || 'all';
     const matches = buses.filter(bus => {
@@ -1574,38 +1578,81 @@
     });
     const labels = {all:'all buses',moving:'moving buses',stopped:'stopped / slow buses',fresh:'buses with fresh GPS',stale:'buses with stale or unknown GPS',favourites:'favourite buses'};
     $('busResults').textContent = `Showing ${matches.length} of ${buses.length} ${labels[filter] || 'buses'}`;
-    if (!matches.length) { host.innerHTML = '<div class="hint">No buses match your search or filter.</div>'; return; }
+    if (!matches.length) {
+      if (!host.querySelector('.hint')) host.replaceChildren(Object.assign(document.createElement('div'), {className:'hint', textContent:'No buses match your search or filter.'}));
+      return;
+    }
     matches.sort((a,b) => {
       const favRank = x => favouriteBusIds.has(String(x.id)) ? 0 : 1;
       const rank = x => busState(x) === 'Moving' ? 0 : 1;
       return favRank(a)-favRank(b) || rank(a)-rank(b) || (userPos ? distanceKm(userPos,{lat:+a.latitude,lon:+a.longitude})-distanceKm(userPos,{lat:+b.latitude,lon:+b.longitude}) : 0);
-    }).forEach(bus => {
-      const button = document.createElement('button');
-      button.className = 'bus' + (String(bus.id) === String(selectedId) ? ' active' : '');
-      const left = document.createElement('span');
-      const dotClass = busState(bus) === 'Moving' ? '' : ' stopped';
-      left.innerHTML = `<span class="dot${dotClass}"></span>`;
-      left.append(document.createTextNode(bus.name || `Vehicle ${bus.id}`));
-      const meta = document.createElement('small');
-      meta.className = 'bus-meta'; meta.textContent = `${busState(bus)} • ${freshness(bus)}`;
-      left.append(meta);
-      const actions = document.createElement('span');
-      actions.className = 'bus-row-actions';
-      const right = document.createElement('small');
-      right.className = 'bus-speed';
-      right.textContent = `${Number(bus.speed || 0).toFixed(1)} km/h`;
-      const fav = document.createElement('button');
-      fav.type = 'button';
-      fav.className = 'bus-favourite' + (favouriteBusIds.has(String(bus.id)) ? ' is-favourite' : '');
-      fav.textContent = favouriteBusIds.has(String(bus.id)) ? '★' : '☆';
-      fav.setAttribute('aria-label', favouriteBusIds.has(String(bus.id)) ? `Remove ${bus.name || bus.id} from favourites` : `Add ${bus.name || bus.id} to favourites`);
-      fav.title = favouriteBusIds.has(String(bus.id)) ? 'Remove from favourites' : 'Add to favourites';
-      fav.addEventListener('click', event => { event.stopPropagation(); toggleFavourite(bus.id); });
-      actions.append(right,fav);
-      button.append(left,actions);
-      button.addEventListener('click', () => selectBus(bus.id));
-      host.append(button);
     });
+
+    // Keep one DOM row per bus. Update its text in place instead of clearing
+    // and rebuilding the list on every 10-second live-data refresh.
+    const existing = new Map([...host.querySelectorAll('[data-bus-row]')].map(row => [row.dataset.busRow, row]));
+    const desiredRows = [];
+    for (const bus of matches) {
+      const id = String(bus.id);
+      let button = existing.get(id);
+      if (!button) {
+        button = document.createElement('button');
+        button.type = 'button';
+        button.dataset.busRow = id;
+        button.className = 'bus';
+        const left = document.createElement('span');
+        left.className = 'bus-row-main';
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        const name = document.createElement('span');
+        name.className = 'bus-row-name';
+        const meta = document.createElement('small');
+        meta.className = 'bus-meta';
+        left.append(dot, name, meta);
+        const actions = document.createElement('span');
+        actions.className = 'bus-row-actions';
+        const speed = document.createElement('small');
+        speed.className = 'bus-speed';
+        const fav = document.createElement('button');
+        fav.type = 'button';
+        fav.className = 'bus-favourite';
+        fav.addEventListener('click', event => {
+          event.stopPropagation();
+          toggleFavourite(button.dataset.busRow);
+        });
+        actions.append(speed, fav);
+        button.append(left, actions);
+        button.addEventListener('click', event => {
+          if (event.target.closest('.bus-favourite')) return;
+          selectBus(button.dataset.busRow);
+        });
+      }
+      const nameText = bus.name || `Vehicle ${bus.id}`;
+      const state = busState(bus);
+      const favOn = favouriteBusIds.has(id);
+      button.classList.toggle('active', id === String(selectedId));
+      const dot = button.querySelector('.dot');
+      dot.classList.toggle('stopped', state !== 'Moving');
+      button.querySelector('.bus-row-name').textContent = nameText;
+      button.querySelector('.bus-meta').textContent = `${state} • ${freshness(bus)}`;
+      button.querySelector('.bus-speed').textContent = `${Number(bus.speed || 0).toFixed(1)} km/h`;
+      const fav = button.querySelector('.bus-favourite');
+      fav.classList.toggle('is-favourite', favOn);
+      fav.textContent = favOn ? '★' : '☆';
+      fav.setAttribute('aria-label', favOn ? `Remove ${nameText} from favourites` : `Add ${nameText} to favourites`);
+      fav.title = favOn ? 'Remove from favourites' : 'Add to favourites';
+      desiredRows.push(button);
+      existing.delete(id);
+    }
+    for (const staleRow of existing.values()) staleRow.remove();
+    const currentOrder = [...host.querySelectorAll('[data-bus-row]')];
+    const orderChanged = currentOrder.length !== desiredRows.length ||
+      currentOrder.some((row, index) => row !== desiredRows[index]);
+    if (orderChanged) {
+      const fragment = document.createDocumentFragment();
+      desiredRows.forEach(row => fragment.append(row));
+      host.replaceChildren(fragment);
+    }
   }
   function renderBuses(items) {
     recordBusSamples(items);
